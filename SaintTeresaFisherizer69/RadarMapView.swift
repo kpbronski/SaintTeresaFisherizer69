@@ -4,7 +4,7 @@
 // tool and freehand drawing annotations. Radar/weather layers to be added later.
 
 import SwiftUI
-@preconcurrency import MapboxMaps
+@preconcurrency @_spi(Experimental) import MapboxMaps
 
 // MARK: - Constants
 
@@ -19,10 +19,18 @@ private enum MapConstants {
     )
 }
 
+// MARK: - Shared MapView Reference
+
+/// Allows SwiftUI siblings to access the MapView for coordinate projection.
+final class MapViewReference: @unchecked Sendable {
+    weak var mapView: MapView?
+}
+
 // MARK: - UIViewRepresentable
 
 struct RadarMapView: UIViewRepresentable {
 
+    var mapViewRef: MapViewReference?
     var rulerState: RulerState
     var drawingState: DrawingState
     var isDrawing: Bool
@@ -34,7 +42,10 @@ struct RadarMapView: UIViewRepresentable {
     var showENC: Bool
     var showGOESIR: Bool
     var showGOESVis: Bool
+    var showWindHeatmap: Bool
+    var windSnapshot: WindFieldSnapshot?
     var resetNorthTrigger: Int
+    var chartTileCache: ChartTileCacheService
     var onStyleLoaded: (() -> Void)?
 
     // MARK: Make
@@ -52,6 +63,9 @@ struct RadarMapView: UIViewRepresentable {
         mapView.ornaments.options.attributionButton.margins  = CGPoint(x: -200, y: -200)
 
         mapView.mapboxMap.setCamera(to: MapConstants.initialCamera)
+
+        // Expose MapView to SwiftUI siblings for particle overlay
+        mapViewRef?.mapView = mapView
 
         let coord = context.coordinator
         coord.mapViewRef = mapView
@@ -180,6 +194,21 @@ struct RadarMapView: UIViewRepresentable {
             }
         }
 
+        // ── Wind Heatmap toggle ──
+        if showWindHeatmap != coord.showWindHeatmap {
+            coord.showWindHeatmap = showWindHeatmap
+            if showWindHeatmap {
+                if let snapshot = windSnapshot {
+                    coord.updateWindHeatmap(snapshot: snapshot, on: mapView)
+                }
+            } else {
+                coord.removeWindHeatmapLayer(from: mapView)
+            }
+        } else if showWindHeatmap, let snapshot = windSnapshot,
+                  snapshot.validTime != coord.lastWindSnapshotTime {
+            coord.updateWindHeatmap(snapshot: snapshot, on: mapView)
+        }
+
         // ── Drawing mode toggle ──
         if isDrawing != coord.isDrawingModeActive {
             coord.setDrawingMode(isDrawing)
@@ -190,7 +219,7 @@ struct RadarMapView: UIViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(rulerState: rulerState, drawingState: drawingState, onStyleLoaded: onStyleLoaded)
+        Coordinator(rulerState: rulerState, drawingState: drawingState, chartTileCache: chartTileCache, onStyleLoaded: onStyleLoaded)
     }
 
     // MARK: - Coordinator
@@ -199,6 +228,7 @@ struct RadarMapView: UIViewRepresentable {
 
         let rulerState: RulerState
         let drawingState: DrawingState
+        let chartTileCache: ChartTileCacheService
         var onStyleLoaded: (() -> Void)?
 
         weak var mapViewRef: MapView?
@@ -226,11 +256,12 @@ struct RadarMapView: UIViewRepresentable {
         var showNEXRAD = false
         var nexradSourceAdded = false
 
-        // NOAA ENC Chart layer (single raster tile layer)
+        // NOAA ENC Chart layer (CustomRasterSource with disk cache)
         private static let encSourceId = "noaa-enc"
         private static let encLayerId = "noaa-enc-layer"
         var showENC = false
         var encSourceAdded = false
+        private var encRequiredTiles: Set<String> = []
 
         // GOES Satellite layers (Iowa Mesonet tile cache)
         private static let goesIRSourceId = "goes-ir"
@@ -243,6 +274,13 @@ struct RadarMapView: UIViewRepresentable {
         var goesIRSourceAdded = false
         var showGOESVis = false
         var goesVisSourceAdded = false
+
+        // Wind heatmap layer (ImageSource with geo-referenced UIImage)
+        private static let windHeatmapSourceId = "wind-heatmap"
+        private static let windHeatmapLayerId = "wind-heatmap-layer"
+        var showWindHeatmap = false
+        var windHeatmapSourceAdded = false
+        var lastWindSnapshotTime: Date?
 
         // HRRR REFD preloaded multi-layer system (73 frames, opacity-toggled)
         private static let hrrrFrameCount = 73
@@ -268,9 +306,10 @@ struct RadarMapView: UIViewRepresentable {
 
         private enum RulerEndpoint { case start, end }
 
-        init(rulerState: RulerState, drawingState: DrawingState, onStyleLoaded: (() -> Void)?) {
+        init(rulerState: RulerState, drawingState: DrawingState, chartTileCache: ChartTileCacheService, onStyleLoaded: (() -> Void)?) {
             self.rulerState = rulerState
             self.drawingState = drawingState
+            self.chartTileCache = chartTileCache
             self.onStyleLoaded = onStyleLoaded
         }
 
@@ -289,6 +328,8 @@ struct RadarMapView: UIViewRepresentable {
             encSourceAdded = false
             goesIRSourceAdded = false
             goesVisSourceAdded = false
+            windHeatmapSourceAdded = false
+            lastWindSnapshotTime = nil
             let prevNEXRADFrame = activeNEXRADFrame
             let prevHRRRFrame = activeHRRRFrame
             activeNEXRADFrame = -1
@@ -320,28 +361,86 @@ struct RadarMapView: UIViewRepresentable {
             }
         }
 
-        // MARK: - NOAA ENC Chart Layer
+        // MARK: - NOAA ENC Chart Layer (CustomRasterSource + Disk Cache)
         //
-        // NOAA Chart Display Service (WMTS) — GoogleMapsCompatible tile matrix.
-        // Renders ENC vector data with traditional chart symbology.
-        // Tiles available z=0–7; Mapbox overscales at higher zooms.
+        // Uses CustomRasterSource with ChartTileCacheService for cache-first
+        // tile loading. Tiles come from NOAA's WMTS pre-rendered endpoint
+        // (much faster than the old WMS on-the-fly rendering).
+        //
+        // Flow: Mapbox requests tile → check disk cache → serve cached OR
+        //       fetch from NOAA WMTS → cache to disk → serve to Mapbox.
 
-        /// Adds the NOAA ENC raster tile layer below weather layers.
-        /// Uses the NOAA Chart Display Service WMS with S-52 symbology.
+        /// Adds the NOAA ENC chart layer using CustomRasterSource for cache-first loading.
         func addENCLayer(on mapView: MapView) {
-            guard styleLoaded else { return }
+            guard styleLoaded else {
+                print("[ENC] addENCLayer called but style not loaded yet")
+                return
+            }
             let map: MapboxMap = mapView.mapboxMap
             removeENCLayer(from: mapView)
+            print("[ENC] Adding CustomRasterSource ENC layer...")
 
-            var source = RasterSource(id: Self.encSourceId)
-            source.tiles = [
-                "https://gis.charttools.noaa.gov/arcgis/rest/services/MCS/NOAAChartDisplay/MapServer/exts/MaritimeChartService/WMSServer?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=0,1,2,3,4,5,6,7&STYLES=&SRS=EPSG:3857&BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256&FORMAT=image/png"
-            ]
-            source.tileSize = 256
-            source.minzoom = 3
-            source.maxzoom = 17
-            // Limit tile requests to Big Bend / St. Teresa region only
-            source.bounds = [-85.8, 29.2, -83.2, 30.8]
+            let cache = chartTileCache
+
+            let client = CustomRasterSourceClient.fromCustomRasterSourceTileStatusChangedCallback { [weak self, weak mapView] (tileID, status) in
+                guard let self else {
+                    print("[ENC] Callback: self is nil")
+                    return
+                }
+
+                switch status {
+                case .required:
+                    let key = "\(tileID.z)/\(tileID.x)/\(tileID.y)"
+                    self.encRequiredTiles.insert(key)
+                    print("[ENC] Tile REQUIRED: \(key)")
+
+                    Task { @MainActor in
+                        guard let image = await cache.tile(z: Int(tileID.z), x: Int(tileID.x), y: Int(tileID.y)) else {
+                            print("[ENC] Tile fetch FAILED: \(key)")
+                            return
+                        }
+                        guard let mapView else {
+                            print("[ENC] MapView nil, can't set tile: \(key)")
+                            return
+                        }
+
+                        let tileData = CustomRasterSourceTileData(tileId: tileID, image: image)
+                        do {
+                            try mapView.mapboxMap.setCustomRasterSourceTileData(
+                                forSourceId: Self.encSourceId,
+                                tiles: [tileData]
+                            )
+                            print("[ENC] Tile SET: \(key) (\(image.size.width)x\(image.size.height))")
+                        } catch {
+                            print("[ENC] setTileData error: \(error)")
+                        }
+                    }
+
+                case .notNeeded, .optional:
+                    let key = "\(tileID.z)/\(tileID.x)/\(tileID.y)"
+                    self.encRequiredTiles.remove(key)
+                    cache.cancelTileFetch(z: Int(tileID.z), x: Int(tileID.x), y: Int(tileID.y))
+
+                    if let mapView {
+                        try? mapView.mapboxMap.setCustomRasterSourceTileData(
+                            forSourceId: Self.encSourceId,
+                            tiles: [CustomRasterSourceTileData(tileId: tileID, image: nil)]
+                        )
+                    }
+
+                default:
+                    break
+                }
+            }
+
+            let options = CustomRasterSourceOptions(
+                clientCallback: client,
+                minZoom: 3,
+                maxZoom: 16,
+                tileSize: 256
+            )
+
+            let source = CustomRasterSource(id: Self.encSourceId, options: options)
 
             var layer = RasterLayer(id: Self.encLayerId, source: Self.encSourceId)
             layer.rasterOpacity = .constant(0.85)
@@ -357,6 +456,7 @@ struct RadarMapView: UIViewRepresentable {
                 } else {
                     try map.addLayer(layer)
                 }
+                print("[ENC] Layer added successfully")
             } catch {
                 print("[ENC] Failed to add layer: \(error)")
             }
@@ -375,6 +475,7 @@ struct RadarMapView: UIViewRepresentable {
             let map: MapboxMap = mapView.mapboxMap
             try? map.removeLayer(withId: Self.encLayerId)
             try? map.removeSource(withId: Self.encSourceId)
+            encRequiredTiles.removeAll()
             encSourceAdded = false
         }
 
@@ -502,6 +603,91 @@ struct RadarMapView: UIViewRepresentable {
             try? map.removeLayer(withId: Self.goesVisWestLayerId)
             try? map.removeSource(withId: Self.goesVisWestSourceId)
             goesVisSourceAdded = false
+        }
+
+        // MARK: - Wind Heatmap Layer (ImageSource)
+        //
+        // Renders the WindFieldSnapshot as a small UIImage (16x16 pixels)
+        // and places it on the map via Mapbox ImageSource. Mapbox's bilinear
+        // resampling smooths the result at screen resolution.
+        // Layer ordering: below ENC/HRRR/NEXRAD, above the base map.
+
+        func updateWindHeatmap(snapshot: WindFieldSnapshot, on mapView: MapView) {
+            guard styleLoaded else {
+                print("[Wind] updateWindHeatmap called but style not loaded yet")
+                return
+            }
+
+            guard let image = BeaufortInshoreRamp.heatmapImage(from: snapshot, alpha: 140) else {
+                print("[Wind] Failed to generate heatmap image")
+                return
+            }
+
+            // Write image to temp file — Mapbox ImageSource works reliably via URL
+            guard let pngData = image.pngData() else {
+                print("[Wind] Failed to encode heatmap PNG")
+                return
+            }
+            let tempURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("wind_heatmap.png")
+            do {
+                try pngData.write(to: tempURL)
+            } catch {
+                print("[Wind] Failed to write heatmap temp file: \(error)")
+                return
+            }
+
+            let map: MapboxMap = mapView.mapboxMap
+            let bbox = snapshot.bbox
+
+            // Coordinates: [top-left, top-right, bottom-right, bottom-left]
+            // Each is [longitude, latitude]
+            let coordinates: [[Double]] = [
+                [bbox.minLon, bbox.maxLat],  // top-left (NW)
+                [bbox.maxLon, bbox.maxLat],  // top-right (NE)
+                [bbox.maxLon, bbox.minLat],  // bottom-right (SE)
+                [bbox.minLon, bbox.minLat],  // bottom-left (SW)
+            ]
+
+            if windHeatmapSourceAdded {
+                // Remove and re-add to update (reliable across Mapbox SDK versions)
+                removeWindHeatmapLayer(from: mapView)
+            }
+
+            var source = ImageSource(id: Self.windHeatmapSourceId)
+            source.coordinates = coordinates
+            source.url = tempURL.absoluteString
+
+            var layer = RasterLayer(id: Self.windHeatmapLayerId, source: Self.windHeatmapSourceId)
+            layer.rasterOpacity = .expression(Exp(.interpolate) { Exp(.linear); Exp(.zoom); 8; 0.55; 12; 0.40; 15; 0.25 })
+            layer.rasterFadeDuration = .constant(0.3)
+            layer.rasterResampling = .constant(.linear)
+
+            do {
+                try map.addSource(source)
+                // Insert below other overlays so it's the lowest overlay layer
+                let belowLayer = encSourceAdded ? Self.encLayerId : (hrrrLayerIds.first ?? nexradLayerIds.first)
+                if let belowId = belowLayer, (try? map.layer(withId: belowId)) != nil {
+                    try map.addLayer(layer, layerPosition: .below(belowId))
+                } else {
+                    try map.addLayer(layer)
+                }
+
+                windHeatmapSourceAdded = true
+                print("[Wind] Heatmap layer added successfully")
+            } catch {
+                print("[Wind] Failed to add heatmap layer: \(error)")
+            }
+
+            lastWindSnapshotTime = snapshot.validTime
+        }
+
+        func removeWindHeatmapLayer(from mapView: MapView) {
+            let map: MapboxMap = mapView.mapboxMap
+            try? map.removeLayer(withId: Self.windHeatmapLayerId)
+            try? map.removeSource(withId: Self.windHeatmapSourceId)
+            windHeatmapSourceAdded = false
+            lastWindSnapshotTime = nil
         }
 
         // MARK: - NEXRAD Multi-Layer Preload System
