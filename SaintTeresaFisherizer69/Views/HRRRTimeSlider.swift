@@ -40,7 +40,7 @@ struct HRRRTimeSlider: View {
                     Image(systemName: "bolt.horizontal.fill")
                         .font(.system(size: 8))
                         .foregroundStyle(Color.orange)
-                    Text("HRRR")
+                    Text("FORECAST")
                         .font(.system(size: 10, weight: .black, design: .monospaced))
                         .foregroundStyle(Color.orange)
                 }
