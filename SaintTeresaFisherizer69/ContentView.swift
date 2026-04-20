@@ -1,4 +1,71 @@
 import SwiftUI
+import UIKit
+
+// MARK: - Long-Press Scrub Host (UIKit bridge)
+//
+// Hosts a single UILongPressGestureRecognizer configured so it does NOT
+// consume touches (cancelsTouchesInView = false) — this lets the parent
+// SwiftUI ScrollView's pan recognizer keep working during the 0.35s wait
+// window. If the user moves beyond `allowableMovement` within the window,
+// our recognizer fails cleanly and the ScrollView scrolls as usual.
+// When the long-press succeeds, we set scrubHourFraction; the caller uses
+// .scrollDisabled(...) on the ScrollView to lock scrolling while scrubbing.
+fileprivate struct LongPressScrubView: UIViewRepresentable {
+    @Binding var scrubHourFraction: Double?
+    let barSpacing: CGFloat
+    let hourCount: Int
+
+    final class Coordinator: NSObject {
+        var onUpdate: (CGPoint) -> Void = { _ in }
+        var onClear: () -> Void = {}
+
+        @objc func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
+            switch recognizer.state {
+            case .began, .changed:
+                onUpdate(recognizer.location(in: recognizer.view))
+            case .ended, .cancelled, .failed:
+                onClear()
+            default:
+                break
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.backgroundColor = .clear
+        let lp = UILongPressGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleLongPress)
+        )
+        lp.minimumPressDuration = 0.35
+        lp.allowableMovement = 10
+        lp.cancelsTouchesInView = false
+        lp.delaysTouchesBegan = false
+        lp.delaysTouchesEnded = false
+        view.addGestureRecognizer(lp)
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        // Refresh closures each update so latest bindings/params are captured.
+        context.coordinator.onUpdate = { location in
+            guard hourCount > 0 else { return }
+            let raw = Double((location.x - 20) / barSpacing)
+            let clamped = max(0, min(Double(hourCount - 1), raw))
+            // Round to whole minutes (1/60 of an hour). SwiftUI skips state
+            // invalidation when the assigned value equals the current value,
+            // so finger movements within the same minute are free.
+            let minuteRounded = (clamped * 60).rounded() / 60
+            scrubHourFraction = minuteRounded
+        }
+        context.coordinator.onClear = {
+            scrubHourFraction = nil
+        }
+    }
+}
 
 // MARK: - Content View
 
@@ -6,6 +73,7 @@ struct ContentView: View {
     @State var viewModel = ForecastViewModel()
     @State private var nowPulse: Bool = false
     @State private var showAbout = false
+    @State private var scrubHourFraction: Double? = nil
 
     var body: some View {
         TabView {
@@ -200,38 +268,10 @@ struct ContentView: View {
                 .fill(Theme.teal.opacity(0.2))
                 .frame(height: 0.5)
 
-            // Station label
-            HStack(spacing: 4) {
-                Image(systemName: "mappin.circle.fill")
-                    .font(.system(size: 10))
-                    .foregroundStyle(Theme.gold.opacity(0.6))
-                Text(viewModel.selectedLocation.conditionsBlendLabel)
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.35))
-                    .tracking(0.8)
-                Spacer()
-                if let ts = viewModel.currentConditions.timestamp {
-                    Text(ts)
-                        .font(.system(size: 9, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.25))
-                }
-            }
-            .padding(.horizontal, 14)
-            .padding(.top, 5)
-            .padding(.bottom, 4)
-
-            // Main data grid — 2 rows x 3 columns
+            // Main data grid — 2 rows x 3 columns, matches LiveConditionsView layout
             VStack(spacing: 6) {
-                // Row 1: Tide, Wind, Gusts
+                // Row 1: Wind, Gusts, Temp
                 HStack(spacing: 0) {
-                    ConditionMetricView(
-                        symbol: "water.waves",
-                        label: "TIDE",
-                        value: viewModel.currentTideString,
-                        detail: viewModel.currentTideSubtitle,
-                        accentColor: Theme.teal
-                    )
-                    ConditionDividerView()
                     ConditionMetricView(
                         symbol: "wind",
                         label: "WIND",
@@ -247,6 +287,14 @@ struct ContentView: View {
                         detail: gustDetail,
                         accentColor: gustMetricColor
                     )
+                    ConditionDividerView()
+                    ConditionMetricView(
+                        symbol: "thermometer.medium",
+                        label: "TEMP",
+                        value: formatTemp(viewModel.currentConditions.temperatureF),
+                        detail: "Fahrenheit",
+                        accentColor: tempColor
+                    )
                 }
 
                 // Thin separator
@@ -255,16 +303,8 @@ struct ContentView: View {
                     .frame(height: 0.5)
                     .padding(.horizontal, 8)
 
-                // Row 2: Temp, Wind Chill, Conditions
+                // Row 2: Wind Chill, Conditions, Pressure
                 HStack(spacing: 0) {
-                    ConditionMetricView(
-                        symbol: "thermometer.medium",
-                        label: "TEMP",
-                        value: formatTemp(viewModel.currentConditions.temperatureF),
-                        detail: "Fahrenheit",
-                        accentColor: tempColor
-                    )
-                    ConditionDividerView()
                     ConditionMetricView(
                         symbol: "thermometer.snowflake",
                         label: "WIND CHILL",
@@ -273,23 +313,15 @@ struct ContentView: View {
                         accentColor: chillColor
                     )
                     ConditionDividerView()
-                    if viewModel.selectedLocation.usesNDBC {
-                        ConditionMetricView(
-                            symbol: "water.waves",
-                            label: "WATER TEMP",
-                            value: formatTemp(viewModel.currentConditions.waterTemperatureF),
-                            detail: "Sea Surface",
-                            accentColor: waterTempColor
-                        )
-                    } else {
-                        ConditionMetricView(
-                            symbol: conditionsSymbol,
-                            label: "CONDITIONS",
-                            value: conditionsDescription,
-                            detail: conditionsDetail,
-                            accentColor: conditionsColor
-                        )
-                    }
+                    conditionsIconCell
+                    ConditionDividerView()
+                    ConditionMetricView(
+                        symbol: "barometer",
+                        label: "PRESSURE",
+                        value: formatPressure(viewModel.currentConditions.pressureInHg),
+                        detail: "inHg",
+                        accentColor: pressureColor(viewModel.currentConditions.pressureInHg)
+                    )
                 }
             }
             .padding(.horizontal, 6)
@@ -314,6 +346,19 @@ struct ContentView: View {
     private func formatTemp(_ tempF: Double?) -> String {
         guard let tempF else { return "--" }
         return "\(Int(round(tempF)))°F"
+    }
+
+    private func formatPressure(_ pressure: Double?) -> String {
+        guard let pressure else { return "--" }
+        return String(format: "%.2f", pressure)
+    }
+
+    private func pressureColor(_ pressure: Double?) -> Color {
+        guard let p = pressure else { return .white.opacity(0.5) }
+        if p < 29.50 { return Theme.windRed }
+        if p < 29.85 { return Theme.windYellow }
+        if p > 30.20 { return Color(hex: "64B5F6") }
+        return Theme.brightGreen
     }
 
     private var windDetail: String {
@@ -353,6 +398,52 @@ struct ContentView: View {
         guard let code = viewModel.currentConditions.conditionsIconCode else { return .white.opacity(0.5) }
         let c = WindUtilities.conditionColor(iconCode: code)
         return Color(red: Double(c.r) / 255, green: Double(c.g) / 255, blue: Double(c.b) / 255)
+    }
+
+    /// Conditions cell that uses the palette-rendered weather glyph (cloud.sun, etc.)
+    /// in place of a text label like "Fair". Pulled from the current forecast hour
+    /// so it uses the same symbol/color logic as the hourly chart icons.
+    private var conditionsIconCell: some View {
+        let data = viewModel.forecastHours
+        let currentIdx = data.firstIndex(where: { $0.hourOffset == 0 }) ?? 0
+        let daylight = ForecastViewModel.daylightIndexSet(data: data)
+        let isNight = !daylight.contains(currentIdx)
+        let currentHour = data.first(where: { $0.hourOffset == 0 })
+        let code = currentHour?.weatherCode ?? 0
+        let cloudPct = currentHour?.cloudCoverPercent ?? viewModel.currentConditions.cloudCoverPercent
+        let sym = WindUtilities.wmoSymbol(code: code, isNight: isNight, cloudCoverPercent: cloudPct)
+        let rgb = WindUtilities.wmoColor(code: code, isNight: isNight, cloudCoverPercent: cloudPct)
+        let palette = WindUtilities.wmoSymbolColors(sym: sym, baseRgb: rgb)
+        let primary = Color(red: Double(palette.primary.r)/255, green: Double(palette.primary.g)/255, blue: Double(palette.primary.b)/255)
+        let secondary = Color(red: Double(palette.secondary.r)/255, green: Double(palette.secondary.g)/255, blue: Double(palette.secondary.b)/255)
+
+        return VStack(spacing: 2) {
+            HStack(spacing: 3) {
+                Image(systemName: "cloud.sun.fill")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.4))
+                Text("CONDITIONS")
+                    .font(.system(size: 9, weight: .black, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.4))
+                    .tracking(0.5)
+            }
+
+            Image(systemName: sym)
+                .font(.system(size: 28, weight: .bold))
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(primary, secondary)
+                .shadow(color: primary.opacity(0.35), radius: 5)
+                .frame(height: 30)
+
+            if !conditionsDetail.isEmpty {
+                Text(conditionsDetail)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.35))
+                    .lineLimit(1)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 3)
     }
 
     // MARK: - Condition Colors
@@ -401,15 +492,149 @@ struct ContentView: View {
 
     // MARK: - Wind Tide Horizon Card
 
+    private struct SummaryValues {
+        let timeText: String
+        let tideFt: Double?
+        let rateFtPerHr: Double?
+        let windKts: Double?
+        let windColor: Color
+        let isScrubbed: Bool
+    }
+
+    private func summaryValues(data: [ForecastHour]) -> SummaryValues {
+        if let frac = scrubHourFraction, !data.isEmpty {
+            let clamped = max(0, min(Double(data.count - 1), frac))
+            let i0 = Int(clamped.rounded(.down))
+            let i1 = min(i0 + 1, data.count - 1)
+            let t = clamped - Double(i0)
+            let h0 = data[i0]
+            let h1 = data[i1]
+            let tide = h0.tideFt * (1 - t) + h1.tideFt * t
+            let rate = h1.tideFt - h0.tideFt
+            let w0 = h0.windKts
+            let w1 = h1.windKts
+            let wind: Double? = {
+                if let a = w0, let b = w1 { return a * (1 - t) + b * t }
+                return w0 ?? w1
+            }()
+            let minuteOffset = Int((t * 60).rounded())
+            let date = DateUtilities.calendar.date(byAdding: .minute, value: minuteOffset, to: h0.date) ?? h0.date
+            let color = wind.map { windColor(for: $0) } ?? Theme.brightGreen
+            return SummaryValues(
+                timeText: DateUtilities.timeDisplay(from: date),
+                tideFt: tide,
+                rateFtPerHr: rate,
+                windKts: wind,
+                windColor: color,
+                isScrubbed: true
+            )
+        }
+        return SummaryValues(
+            timeText: viewModel.currentTimeString,
+            tideFt: viewModel.currentTideFt,
+            rateFtPerHr: viewModel.currentTideRate,
+            windKts: viewModel.currentWindKts,
+            windColor: viewModel.currentWindColor,
+            isScrubbed: false
+        )
+    }
+
+    private var liveTideSummary: some View {
+        let values = summaryValues(data: viewModel.forecastHours)
+        let rate = values.rateFtPerHr
+        let isRising = (rate ?? 0) >= 0
+        let rateColor: Color = isRising ? Theme.brightGreen : Color(hex: "FF2D55")
+        let arrowSymbol = isRising ? "arrow.up.right" : "arrow.down.right"
+        let tideText: String = {
+            guard let ft = values.tideFt else { return "--" }
+            let sign = ft >= 0 ? "+" : ""
+            return "\(sign)\(String(format: "%.1f'", ft))"
+        }()
+        let rateText: String = {
+            guard let r = rate else { return "--" }
+            return "\(String(format: "%.1f", abs(r))) ft/hr"
+        }()
+        let windText: String = {
+            guard let w = values.windKts else { return "--" }
+            return "\(Int(w.rounded())) kts"
+        }()
+
+        return HStack(spacing: 0) {
+            VStack(spacing: 4) {
+                Text(values.isScrubbed ? "TIME·SCRUB" : "TIME")
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(values.isScrubbed ? Color(hex: "4FC3F7") : .white.opacity(0.5))
+                    .tracking(1.2)
+                Text(values.timeText)
+                    .font(.system(size: 18, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white)
+            }
+            .frame(maxWidth: .infinity)
+
+            ConditionDividerView(height: 60)
+
+            VStack(spacing: 4) {
+                Text("TIDE")
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.5))
+                    .tracking(1.2)
+                Text(tideText)
+                    .font(.system(size: 18, weight: .bold, design: .monospaced))
+                    .foregroundStyle(Color(hex: "4FC3F7"))
+            }
+            .frame(maxWidth: .infinity)
+
+            ConditionDividerView(height: 60)
+
+            VStack(spacing: 4) {
+                Text("RATE")
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.5))
+                    .tracking(1.2)
+                HStack(spacing: 3) {
+                    Image(systemName: arrowSymbol)
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(rateColor)
+                    Text(rateText)
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.white)
+                }
+            }
+            .frame(maxWidth: .infinity)
+
+            ConditionDividerView(height: 60)
+
+            VStack(spacing: 4) {
+                Text("WIND")
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.5))
+                    .tracking(1.2)
+                Text(windText)
+                    .font(.system(size: 18, weight: .bold, design: .monospaced))
+                    .foregroundStyle(values.windColor)
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .padding(.horizontal, 10)
+    }
+
     private var windTideHorizonCard: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("Wind & Tide Forecast")
-                .font(.system(size: 22, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.horizontal, 16)
-                .padding(.top, 16)
-                .padding(.bottom, 10)
+            HStack(spacing: 6) {
+                Image(systemName: "chart.xyaxis.line")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(Theme.teal.opacity(0.7))
+                Text("TIDE + WEATHER")
+                    .font(.system(size: 11, weight: .black, design: .monospaced))
+                    .foregroundStyle(Theme.teal.opacity(0.7))
+                    .tracking(1.5)
+            }
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.top, 6)
+            .padding(.bottom, 2)
+
+            liveTideSummary
+                .frame(height: 60)
 
             ZStack(alignment: .leading) {
                 if viewModel.forecastHours.isEmpty {
@@ -420,12 +645,15 @@ struct ContentView: View {
                 } else {
                 ScrollViewReader { proxy in
                     ScrollView(.horizontal, showsIndicators: false) {
-                        ZStack(alignment: .top) {
+                        ZStack(alignment: .topLeading) {
                             timelineContent
+                            scrubSelectorOverlay
                         }
-                        .frame(height: 380)
+                        .frame(height: 382)
                         .padding(.horizontal, 16)
                     }
+                    .scrollDisabled(scrubHourFraction != nil)
+                    .sensoryFeedback(.selection, trigger: scrubHourFraction != nil)
                     .task {
                         // Brief yield to let the ScrollView layout before scrolling
                         try? await Task.sleep(for: .milliseconds(50))
@@ -440,41 +668,15 @@ struct ContentView: View {
                 } // else (data available)
             }
 
-            HStack(spacing: 16) {
-                legendDot(color: Theme.brightGreen, label: "<8 kts")
-                legendDot(color: Theme.windYellow, label: "8–12 kts")
-                legendDot(color: Theme.windRed, label: ">12 kts")
-                Spacer()
-                HStack(spacing: 4) {
-                    Image(systemName: "drop.fill")
-                        .font(.system(size: 8))
-                        .foregroundStyle(.cyan.opacity(0.6))
-                    Text("Rain")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.35))
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.bottom, 14)
-            .padding(.top, 6)
         }
         .glassCard(cornerRadius: 18)
-    }
-
-    private func legendDot(color: Color, label: String) -> some View {
-        HStack(spacing: 4) {
-            Circle().fill(color).frame(width: 6, height: 6)
-            Text(label)
-                .font(.system(size: 9, weight: .medium))
-                .foregroundStyle(.white.opacity(0.35))
-        }
     }
 
     // MARK: - Tide Y-Axis Labels (pinned left)
 
     private var tideYAxisLabels: some View {
         let chartHeight: CGFloat = 230
-        let chartTop: CGFloat = 90
+        let chartTop: CGFloat = 72
         let minTide = viewModel.stats.minTide
         let maxTide = viewModel.stats.maxTide
 
@@ -491,14 +693,6 @@ struct ContentView: View {
 
         return VStack(spacing: 0) {
             ZStack(alignment: .leading) {
-                // Semi-transparent backing so labels are readable over the chart
-                LinearGradient(
-                    colors: [Theme.deepGulf.opacity(0.95), Theme.deepGulf.opacity(0.0)],
-                    startPoint: .leading,
-                    endPoint: .trailing
-                )
-                .frame(width: 42)
-
                 ForEach(ticks, id: \.self) { tick in
                     let y = tideY(tick, chartTop: chartTop, chartHeight: chartHeight)
                     Text(String(format: tick == tick.rounded() ? "%.0f" : "%.1f", tick))
@@ -509,11 +703,11 @@ struct ContentView: View {
 
                 // "ft" unit label at top
                 Text("ft")
-                    .font(.system(size: 8, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Theme.teal.opacity(0.35))
+                    .font(.system(size: 10, weight: .black, design: .monospaced))
+                    .foregroundStyle(Theme.teal)
                     .position(x: 18, y: chartTop - 8)
             }
-            .frame(width: 42, height: 380)
+            .frame(width: 42, height: 382)
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
@@ -526,48 +720,87 @@ struct ContentView: View {
         let barSpacing: CGFloat = 22
         let totalWidth = CGFloat(data.count) * barSpacing + 40
         let chartHeight: CGFloat = 230
-        let chartTop: CGFloat = 90
+        let chartTop: CGFloat = 72
         let windBarMaxH: CGFloat = 160
         let nowIdx = data.firstIndex(where: { $0.hourOffset == 0 }) ?? 24
-        let nowX = 20 + CGFloat(nowIdx) * barSpacing
+        // Shift the NOW line by the current minute-into-hour so it lands on the
+        // exact time rather than snapping to the hour boundary.
+        let nowMinute = DateUtilities.calendar.component(.minute, from: viewModel.now)
+        let nowSecond = DateUtilities.calendar.component(.second, from: viewModel.now)
+        let fractionIntoHour = (Double(nowMinute) + Double(nowSecond) / 60.0) / 60.0
+        let nowX = 20 + (CGFloat(nowIdx) + CGFloat(fractionIntoHour)) * barSpacing
         let zeroY = tideY(0, chartTop: chartTop, chartHeight: chartHeight)
 
         return ZStack(alignment: .topLeading) {
             timelineConditionIcons(data: data, barSpacing: barSpacing)
             timelineDaylightBands(data: data, barSpacing: barSpacing, chartTop: chartTop, chartHeight: chartHeight)
             timelineSunMarkers(data: data, barSpacing: barSpacing)
-            timelineDaySeparators(data: data, barSpacing: barSpacing, chartTop: chartTop, chartHeight: chartHeight)
             timelineZeroLine(zeroY: zeroY, chartTop: chartTop, chartHeight: chartHeight, totalWidth: totalWidth)
             tideCurvePath(data: data, barSpacing: barSpacing, chartTop: chartTop, chartHeight: chartHeight)
-            timelineTideExtrema(data: data, barSpacing: barSpacing, chartTop: chartTop, chartHeight: chartHeight)
             timelineWindBars(data: data, barSpacing: barSpacing, chartTop: chartTop, chartHeight: chartHeight, maxBarH: windBarMaxH)
             timelineNowIndicator(nowX: nowX, chartTop: chartTop, chartHeight: chartHeight)
             timelineScrollAnchors(nowX: nowX, barSpacing: barSpacing, totalWidth: totalWidth)
             timelineTimeLabels(data: data, barSpacing: barSpacing, chartTop: chartTop, chartHeight: chartHeight)
+            timelineTideExtrema(data: data, barSpacing: barSpacing, chartTop: chartTop, chartHeight: chartHeight)
+
+            // Transparent UIKit-backed long-press recognizer.
+            // cancelsTouchesInView = false → ScrollView pan still works until long-press succeeds.
+            LongPressScrubView(
+                scrubHourFraction: $scrubHourFraction,
+                barSpacing: barSpacing,
+                hourCount: data.count
+            )
+            .frame(width: totalWidth, height: 382)
         }
-        .frame(width: totalWidth, height: 380)
+        .frame(width: totalWidth, height: 382)
+    }
+
+    // Scrub selector line — hoisted out of `timelineContent` so that scrub-state
+    // updates don't invalidate the (expensive) wind bars / tide curve subtree.
+    @ViewBuilder
+    private var scrubSelectorOverlay: some View {
+        if let frac = scrubHourFraction {
+            let barSpacing: CGFloat = 22
+            let chartTop: CGFloat = 72
+            let chartHeight: CGFloat = 230
+            let totalWidth = CGFloat(viewModel.forecastHours.count) * barSpacing + 40
+            let scrubX = 20 + CGFloat(frac) * barSpacing
+            let garminMagenta = Color(hex: "FF00B7")
+            Rectangle()
+                .fill(garminMagenta)
+                .frame(width: 3, height: chartHeight + 30)
+                .position(x: scrubX, y: chartTop + chartHeight / 2)
+                .shadow(color: garminMagenta.opacity(0.8), radius: 6)
+                .frame(width: totalWidth, height: 382, alignment: .topLeading)
+                .allowsHitTesting(false)
+        }
     }
 
     // MARK: - Timeline Sub-Views
 
-    @ViewBuilder
     private func timelineConditionIcons(data: [ForecastHour], barSpacing: CGFloat) -> some View {
-        ForEach(Array(data.enumerated()), id: \.offset) { idx, hour in
+        let daylightIndices = ForecastViewModel.daylightIndexSet(data: data)
+        return ForEach(Array(data.enumerated()), id: \.offset) { idx, hour in
             let x = 20 + CGFloat(idx) * barSpacing
             let hourComp = DateUtilities.calendar.component(.hour, from: hour.date)
             if hourComp % 2 == 0 && hour.hourOffset >= 0 {
-                let sym = WindUtilities.wmoSymbol(code: hour.weatherCode)
-                let rgb = WindUtilities.wmoColor(code: hour.weatherCode)
+                let isNight = !daylightIndices.contains(idx)
+                let sym = WindUtilities.wmoSymbol(code: hour.weatherCode, isNight: isNight, cloudCoverPercent: hour.cloudCoverPercent)
+                let rgb = WindUtilities.wmoColor(code: hour.weatherCode, isNight: isNight, cloudCoverPercent: hour.cloudCoverPercent)
+                let palette = WindUtilities.wmoSymbolColors(sym: sym, baseRgb: rgb)
+                let primaryColor = Color(red: Double(palette.primary.r)/255, green: Double(palette.primary.g)/255, blue: Double(palette.primary.b)/255).opacity(0.9)
+                let secondaryColor = Color(red: Double(palette.secondary.r)/255, green: Double(palette.secondary.g)/255, blue: Double(palette.secondary.b)/255).opacity(0.85)
                 Image(systemName: sym)
-                    .font(.system(size: 10))
-                    .foregroundStyle(Color(red: Double(rgb.r)/255, green: Double(rgb.g)/255, blue: Double(rgb.b)/255).opacity(0.8))
-                    .position(x: x, y: 6)
+                    .font(.system(size: 22.18))
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(primaryColor, secondaryColor)
+                    .position(x: x, y: 16)
 
                 if let temp = hour.temperatureF {
                     Text("\(Int(temp.rounded()))°")
-                        .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                        .font(.system(size: 12.67, weight: .semibold, design: .monospaced))
                         .foregroundStyle(.white.opacity(0.5))
-                        .position(x: x, y: 20)
+                        .position(x: x, y: 34)
                 }
             }
         }
@@ -590,8 +823,8 @@ struct ContentView: View {
                         endPoint: .bottom
                     )
                 )
-                .frame(width: width, height: chartHeight)
-                .position(x: startX + width / 2, y: chartTop + chartHeight / 2)
+                .frame(width: width, height: 382)
+                .position(x: startX + width / 2, y: 191)
                 .accessibilityHidden(true)
         }
     }
@@ -601,39 +834,35 @@ struct ContentView: View {
         ForEach(Array(data.enumerated()), id: \.offset) { idx, hour in
             let x = 20 + CGFloat(idx) * barSpacing
             if hour.isSunrise {
-                Image(systemName: "sunrise.fill")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.orange.opacity(0.8))
-                    .position(x: x, y: 42)
+                if let sr = hour.sunriseTime {
+                    Text(DateUtilities.timeDisplay(from: sr))
+                        .font(.system(size: 14, weight: .black, design: .monospaced))
+                        .foregroundStyle(.orange.opacity(0.85))
+                        .position(x: x, y: 342)
+                }
 
-                Text(dayOfWeek(hour.date))
-                    .font(.system(size: 18, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.orange.opacity(0.5))
-                    .position(x: x, y: 56)
+                HStack(spacing: 4) {
+                    Image(systemName: "sunrise.fill")
+                        .font(.system(size: 18))
+                        .foregroundStyle(.orange.opacity(0.85))
+                    Text(hour.dayLabel.uppercased())
+                        .font(.system(size: 18, weight: .bold))
+                        .foregroundStyle(.orange.opacity(0.85))
+                }
+                .position(x: x, y: 364)
             }
             if hour.isSunset {
+                if let ss = hour.sunsetTime {
+                    Text(DateUtilities.timeDisplay(from: ss))
+                        .font(.system(size: 14, weight: .black, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .position(x: x, y: 342)
+                }
+
                 Image(systemName: "moon.fill")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.white.opacity(0.45))
-                    .position(x: x, y: 42)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func timelineDaySeparators(data: [ForecastHour], barSpacing: CGFloat, chartTop: CGFloat, chartHeight: CGFloat) -> some View {
-        ForEach(Array(data.enumerated()), id: \.offset) { idx, hour in
-            if hour.isMidnight && idx > 0 {
-                let x = 20 + CGFloat(idx) * barSpacing
-                Rectangle()
-                    .fill(Theme.teal.opacity(0.15))
-                    .frame(width: 1, height: chartHeight + 20)
-                    .position(x: x, y: chartTop + chartHeight / 2)
-
-                Text(hour.dayLabel)
-                    .font(.system(size: 22, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Theme.teal.opacity(0.55))
-                    .position(x: x, y: 68)
+                    .font(.system(size: 18))
+                    .foregroundStyle(.white.opacity(0.7))
+                    .position(x: x, y: 364)
             }
         }
     }
@@ -658,8 +887,26 @@ struct ContentView: View {
         ForEach(findTideExtrema(data: data), id: \.index) { extremum in
             let x = 20 + CGFloat(extremum.index) * barSpacing
             let curveY = tideY(extremum.tideFt, chartTop: chartTop, chartHeight: chartHeight)
-            let color: Color = extremum.isHigh ? Theme.teal.opacity(0.9) : .orange.opacity(0.9)
-            let labelY: CGFloat = extremum.isHigh ? chartTop - 6 : chartTop + 10
+            let color: Color = extremum.isHigh ? Color(hex: "4FC3F7") : Color(hex: "FF2D55")
+            let timeText = DateUtilities.timeDisplay(from: extremum.date)
+
+            // Label hugs whichever is higher on screen at this x: the tide dot or the
+            // top of the wind-label VStack. This lets each H/L sit as close to its own
+            // curve dot as possible while never covering the wind data.
+            let labelHalfHeight: CGFloat = 13
+            let gap: CGFloat = 8
+            let hour = data[extremum.index]
+            let windLabelTop: CGFloat = {
+                guard let windKts = hour.windKts else {
+                    return chartTop + chartHeight
+                }
+                let barH = CGFloat(windKts / viewModel.stats.maxWind) * 160
+                let barTop = chartTop + chartHeight - 4 - barH
+                return barTop - 60
+            }()
+            let anchorY = min(curveY, windLabelTop)
+            let labelCenterY = anchorY - gap - labelHalfHeight
+            let dashTo = labelCenterY + labelHalfHeight
 
             Circle()
                 .fill(color)
@@ -668,21 +915,19 @@ struct ContentView: View {
 
             Path { path in
                 path.move(to: CGPoint(x: x, y: curveY - 3))
-                path.addLine(to: CGPoint(x: x, y: labelY + (extremum.isHigh ? 16 : 0)))
+                path.addLine(to: CGPoint(x: x, y: dashTo))
             }
-            .stroke(color.opacity(0.35), style: StrokeStyle(lineWidth: 0.8, dash: [3, 2]))
+            .stroke(color.opacity(0.4), style: StrokeStyle(lineWidth: 0.8, dash: [3, 2]))
 
             VStack(spacing: 0) {
-                Text(extremum.isHigh ? "H" : "L")
-                    .font(.system(size: 9, weight: .black))
-                Text(String(format: "%.1f'", extremum.tideFt))
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                Text(extremum.timeLabel)
-                    .font(.system(size: 8, weight: .medium))
+                Text("\(extremum.isHigh ? "H" : "L") \(String(format: "%.1f'", extremum.tideFt))")
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                Text(timeText)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
             }
             .foregroundStyle(color)
-            .position(x: x, y: labelY + 24)
-            .accessibilityLabel("\(extremum.isHigh ? "High" : "Low") tide \(String(format: "%.1f", extremum.tideFt)) feet at \(extremum.timeLabel)")
+            .position(x: x, y: labelCenterY)
+            .accessibilityLabel("\(extremum.isHigh ? "High" : "Low") tide \(String(format: "%.1f", extremum.tideFt)) feet at \(timeText)")
         }
     }
 
@@ -709,7 +954,7 @@ struct ContentView: View {
         Text("NOW")
             .font(.system(size: 8, weight: .bold))
             .foregroundStyle(.white.opacity(nowPulse ? 0.9 : 0.4))
-            .position(x: nowX, y: chartTop + chartHeight + 20)
+            .position(x: nowX, y: 52)
     }
 
     @ViewBuilder
@@ -823,7 +1068,7 @@ struct ContentView: View {
         let index: Int
         let tideFt: Double
         let isHigh: Bool
-        let timeLabel: String
+        let date: Date
     }
 
     private func findTideExtrema(data: [ForecastHour]) -> [TideExtremum] {
@@ -843,22 +1088,27 @@ struct ContentView: View {
 
             if isMax || isMin {
                 if let last = extrema.last, i - last.index < 5 { continue }
+
+                // Parabolic fit on 3 hourly samples around index i to refine the
+                // extremum time to sub-hour precision (NOAA data is cosine-interpolated
+                // from true hi/lo events, so a parabola is an accurate local model).
+                let y0 = data[i - 1].tideFt
+                let y1 = curr
+                let y2 = data[i + 1].tideFt
+                let denom = y0 - 2 * y1 + y2
+                let fracHours: Double = abs(denom) > 0.0001 ? (y0 - y2) / (2 * denom) : 0
+                let minuteOffset = Int((fracHours * 60).rounded())
+                let exactDate = DateUtilities.calendar.date(
+                    byAdding: .minute, value: minuteOffset, to: data[i].date
+                ) ?? data[i].date
+
                 extrema.append(TideExtremum(
                     index: i, tideFt: curr, isHigh: isMax,
-                    timeLabel: data[i].timeLabel
+                    date: exactDate
                 ))
             }
         }
         return extrema
-    }
-
-    /// Short day-of-week string (e.g. "MON", "TUE") for a date.
-    private func dayOfWeek(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.timeZone = DateUtilities.calendar.timeZone
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "EEE"
-        return formatter.string(from: date).uppercased()
     }
 
     // MARK: - Wind Bar View

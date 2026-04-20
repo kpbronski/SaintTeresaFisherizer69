@@ -193,20 +193,18 @@ final class ForecastViewModel {
             }
         }
 
-        // 3. Build sunrise/sunset sets (truncated to hour)
-        var sunriseHours: Set<Date> = []
-        var sunsetHours: Set<Date> = []
+        // 3. Build sunrise/sunset maps (hourStart → exact time)
+        var sunriseByHour: [Date: Date] = [:]
+        var sunsetByHour: [Date: Date] = [:]
 
         for srStr in weather.daily.sunrise {
             if let date = DateUtilities.openMeteoHourlyFormatter.date(from: srStr) {
-                let hourStart = DateUtilities.hourStart(for: date)
-                sunriseHours.insert(hourStart)
+                sunriseByHour[DateUtilities.hourStart(for: date)] = date
             }
         }
         for ssStr in weather.daily.sunset {
             if let date = DateUtilities.openMeteoHourlyFormatter.date(from: ssStr) {
-                let hourStart = DateUtilities.hourStart(for: date)
-                sunsetHours.insert(hourStart)
+                sunsetByHour[DateUtilities.hourStart(for: date)] = date
             }
         }
 
@@ -243,6 +241,7 @@ final class ForecastViewModel {
             let tempC: Double? = wIdx.flatMap { weather.hourly.temperature2m[$0] }
             let precip: Double = wIdx.flatMap { weather.hourly.precipitation[$0] } ?? 0
             let wCode: Int = wIdx.flatMap { weather.hourly.weatherCode[$0] } ?? 0
+            let cloudPct: Double? = wIdx.flatMap { weather.hourly.cloudCover[$0] }
 
             let hour = ForecastHour(
                 date: currentDate,
@@ -258,8 +257,11 @@ final class ForecastViewModel {
                 precipitationMm: precip,
                 weatherCode: wCode,
                 hasRain: WindUtilities.isRainy(weatherCode: wCode),
-                isSunrise: sunriseHours.contains(currentDate),
-                isSunset: sunsetHours.contains(currentDate)
+                cloudCoverPercent: cloudPct,
+                isSunrise: sunriseByHour[currentDate] != nil,
+                isSunset: sunsetByHour[currentDate] != nil,
+                sunriseTime: sunriseByHour[currentDate],
+                sunsetTime: sunsetByHour[currentDate]
             )
 
             hours.append(hour)
@@ -336,6 +338,22 @@ final class ForecastViewModel {
         return "\(direction) \(String(format: "%.1f", abs(rate))) ft/hr"
     }
 
+    /// Current tide rate in ft/hr; positive = rising, negative = falling, nil if no data.
+    var currentTideRate: Double? {
+        guard let curr = currentHour, let next = nextHour else { return nil }
+        return next.tideFt - curr.tideFt
+    }
+
+    /// Current tide height in ft, signed; nil if no data.
+    var currentTideFt: Double? {
+        currentHour?.tideFt
+    }
+
+    /// Current wind speed in knots; nil if no data.
+    var currentWindKts: Double? {
+        currentHour?.windKts
+    }
+
     var currentWindString: String {
         guard let kts = currentHour?.windKts else { return "--" }
         return "\(Int(kts)) kts"
@@ -391,7 +409,7 @@ final class ForecastViewModel {
     private func recomputeFishingWindows() {
         let data = forecastHours
         guard data.count > 1 else { fishingWindows = []; return }
-        let daylight = computeDaylightIndexSet(data: data)
+        let daylight = Self.daylightIndexSet(data: data)
         let threshold = windThresholdKts
 
         var qualifying: [Int] = []
@@ -411,8 +429,8 @@ final class ForecastViewModel {
         fishingWindows = groupIntoWindows(indices: qualifying, data: data)
     }
 
-    private func computeDaylightIndexSet(data: [ForecastHour]) -> Set<Int> {
-        let ranges = Self.computeDaylightRanges(data: data)
+    static func daylightIndexSet(data: [ForecastHour]) -> Set<Int> {
+        let ranges = computeDaylightRanges(data: data)
         var indices = Set<Int>()
         for range in ranges {
             for i in range.start...range.end {
@@ -498,7 +516,8 @@ final class ForecastViewModel {
             timestamp: "2026-02-25 14:15:00",
             conditionsPhrase: "Partly Cloudy",
             conditionsIconCode: 30,
-            waterTemperatureF: nil
+            waterTemperatureF: nil,
+            pressureInHg: 30.12
         )
         return vm
     }
@@ -533,8 +552,11 @@ final class ForecastViewModel {
                 precipitationMm: 0,
                 weatherCode: 0,
                 hasRain: false,
+                cloudCoverPercent: nil,
                 isSunrise: hourOfDay == 7 && i >= 0,
-                isSunset: hourOfDay == 18 && i >= 0
+                isSunset: hourOfDay == 18 && i >= 0,
+                sunriseTime: (hourOfDay == 7 && i >= 0) ? date : nil,
+                sunsetTime: (hourOfDay == 18 && i >= 0) ? date : nil
             ))
         }
         return hours

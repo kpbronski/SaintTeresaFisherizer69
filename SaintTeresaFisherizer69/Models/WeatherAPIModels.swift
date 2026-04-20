@@ -125,6 +125,7 @@ struct CurrentConditions: Sendable {
     let conditionsPhrase: String?
     let conditionsIconCode: Int?
     let waterTemperatureF: Double?
+    let pressureInHg: Double?
 
     var windSpeedKts: Double? {
         windSpeedMPH.map { $0 * 0.868976 }
@@ -147,6 +148,6 @@ struct CurrentConditions: Sendable {
         windDirectionDeg: nil, windChillF: nil, humidity: nil,
         cloudCoverPercent: nil, solarRadiation: nil, timestamp: nil,
         conditionsPhrase: nil, conditionsIconCode: nil,
-        waterTemperatureF: nil
+        waterTemperatureF: nil, pressureInHg: nil
     )
 }

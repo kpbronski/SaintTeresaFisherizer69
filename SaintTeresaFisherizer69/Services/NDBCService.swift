@@ -27,6 +27,7 @@ final class NDBCService: Sendable {
         let waterTempF = obs.waterTempC.map { WindUtilities.celsiusToFahrenheit($0) }
         let windMPH = obs.windSpeedMS.map { $0 * 2.23694 }
         let gustMPH = obs.gustMS.map { $0 * 2.23694 }
+        let pressureInHg = obs.pressureHPa.map { $0 * 0.02953 }
         let windChillF = computeWindChill(tempF: tempF, windMPH: windMPH)
 
         return CurrentConditions(
@@ -41,7 +42,8 @@ final class NDBCService: Sendable {
             timestamp: obs.timestamp,
             conditionsPhrase: nil,
             conditionsIconCode: nil,
-            waterTemperatureF: waterTempF
+            waterTemperatureF: waterTempF,
+            pressureInHg: pressureInHg
         )
     }
 

@@ -23,10 +23,13 @@ struct ForecastHour: Identifiable, Sendable {
     let precipitationMm: Double
     let weatherCode: Int
     let hasRain: Bool
+    let cloudCoverPercent: Double?
 
     // Celestial
     let isSunrise: Bool
     let isSunset: Bool
+    let sunriseTime: Date?
+    let sunsetTime: Date?
 
     // Computed
     var isPast: Bool { hourOffset < 0 }

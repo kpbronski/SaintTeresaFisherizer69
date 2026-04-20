@@ -119,7 +119,8 @@ final class WeatherSTEMService: Sendable {
                 timestamp: conditions.timestamp,
                 conditionsPhrase: wx.wxPhraseLong,
                 conditionsIconCode: wx.iconCode,
-                waterTemperatureF: nil
+                waterTemperatureF: nil,
+                pressureInHg: conditions.pressureInHg
             )
         }
 
@@ -205,7 +206,8 @@ final class WeatherSTEMService: Sendable {
             timestamp: latestTimestamp,
             conditionsPhrase: nil,
             conditionsIconCode: nil,
-            waterTemperatureF: nil
+            waterTemperatureF: nil,
+            pressureInHg: weightedAvg(\.pressureInHg)
         )
     }
 
@@ -261,6 +263,7 @@ final class WeatherSTEMService: Sendable {
         var windChillF: Double?
         var humidity: Double?
         var solarRadiation: Double?
+        var pressureInHg: Double?
 
         for record in response.records {
             guard let numValue = record.value.doubleValue else { continue }
@@ -280,6 +283,8 @@ final class WeatherSTEMService: Sendable {
                 humidity = numValue
             case "Solar Radiation Sensor":
                 solarRadiation = numValue
+            case "Barometer":
+                pressureInHg = numValue
             default:
                 break
             }
@@ -297,7 +302,8 @@ final class WeatherSTEMService: Sendable {
             timestamp: response.time,
             conditionsPhrase: nil,
             conditionsIconCode: nil,
-            waterTemperatureF: nil
+            waterTemperatureF: nil,
+            pressureInHg: pressureInHg
         )
     }
 }
