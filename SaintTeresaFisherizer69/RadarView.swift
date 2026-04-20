@@ -25,23 +25,10 @@ struct RadarView: View {
     @State private var crabSpin: Double = 0
     @State private var chartTileCache = ChartTileCacheService()
 
-    // Wind heatmap state
-    @State private var showWindHeatmap = false
-    @State private var windSnapshots: [WindFieldSnapshot] = []
-    @State private var windCurrentHour: Int = 0
-    @State private var windIsOffline = false
-    @State private var windError: String?
-    @State private var mapViewRef = MapViewReference()
-
-    private var currentWindSnapshot: WindFieldSnapshot? {
-        windSnapshots.isEmpty ? nil : windSnapshots[min(windCurrentHour, windSnapshots.count - 1)]
-    }
-
     var body: some View {
         ZStack(alignment: .top) {
             // Full-screen Mapbox map with ruler + drawing
             RadarMapView(
-                mapViewRef: mapViewRef,
                 rulerState: rulerState,
                 drawingState: drawingState,
                 isDrawing: isDrawing,
@@ -53,8 +40,6 @@ struct RadarView: View {
                 showENC: showENC,
                 showGOESIR: showGOESIR,
                 showGOESVis: showGOESVis,
-                showWindHeatmap: showWindHeatmap,
-                windSnapshot: currentWindSnapshot,
                 resetNorthTrigger: resetNorthTrigger,
                 chartTileCache: chartTileCache,
                 onStyleLoaded: {
@@ -63,29 +48,9 @@ struct RadarView: View {
             )
             .ignoresSafeArea()
 
-            // Wind particle overlay — sits on top of the map in SwiftUI z-order
-            if showWindHeatmap, !windSnapshots.isEmpty {
-                WindParticleView(
-                    snapshot: currentWindSnapshot,
-                    mapViewProvider: { [mapViewRef] in mapViewRef.mapView }
-                )
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
-            }
-
             // Top header
             if !isDrawing && !rulerState.isVisible {
-                VStack(spacing: 8) {
-                    brandHeader
-
-                    if showWindHeatmap {
-                        WindOverlayBadge(
-                            snapshot: currentWindSnapshot,
-                            isOffline: windIsOffline
-                        )
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                    }
-                }
+                brandHeader
             }
 
             // Drawing toolbar slides in from top when active
@@ -197,14 +162,6 @@ struct RadarView: View {
                 withAnimation(.easeOut(duration: 0.2)) {
                     showLayers.toggle()
                 }
-            }
-
-            // Debug zoom indicator
-            TimelineView(.periodic(from: .now, by: 0.5)) { _ in
-                let zoom = mapViewRef.mapView?.mapboxMap.cameraState.zoom ?? 0
-                Text("z\(zoom, specifier: "%.1f")")
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.7))
             }
         }
     }
@@ -377,20 +334,10 @@ struct RadarView: View {
                         Label("NOAA Nautical Chart", systemImage: "map.fill")
                     }
                     .tint(.cyan)
-
-                    Toggle(isOn: $showWindHeatmap) {
-                        Label("Wind Field", systemImage: "wind")
-                    }
-                    .tint(Color(hex: "2EA88A"))
-                    .onChange(of: showWindHeatmap) {
-                        if showWindHeatmap && windSnapshots.isEmpty {
-                            Task { await fetchWindData() }
-                        }
-                    }
                 } header: {
                     Text("Marine")
                 } footer: {
-                    Text("NOAA ENC data rendered with traditional chart symbology — depth contours, buoys, channels, and hazards. Wind field shows HRRR-derived surface winds color-coded by speed.")
+                    Text("NOAA ENC data rendered with traditional chart symbology — depth contours, buoys, channels, and hazards.")
                 }
             }
             .navigationTitle("Map Layers")
@@ -438,34 +385,6 @@ struct RadarView: View {
     private func waitForStyleLoad() async {
         while !mapStyleLoaded {
             try? await Task.sleep(for: .milliseconds(100))
-        }
-    }
-
-    // MARK: - Wind Data Fetching
-
-    private func fetchWindData() async {
-        let service = WindDataService()
-        windIsOffline = false
-        windError = nil
-
-        do {
-            let snapshots = try await service.fetchSnapshots()
-            windSnapshots = snapshots
-            windCurrentHour = 0
-            print("[Wind] Fetched \(snapshots.count) hourly snapshots")
-        } catch {
-            print("[Wind] Network fetch failed: \(error). Trying cache...")
-            // Try offline cache
-            do {
-                let cached = try await service.loadCachedSnapshots()
-                windSnapshots = cached
-                windCurrentHour = 0
-                windIsOffline = true
-                print("[Wind] Loaded \(cached.count) cached snapshots (offline)")
-            } catch {
-                windError = error.localizedDescription
-                print("[Wind] No cache available: \(error)")
-            }
         }
     }
 }
